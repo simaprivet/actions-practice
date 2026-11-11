@@ -1,0 +1,155 @@
+name: Deploy and Test
+
+# Когда запускать: при push в main и вручную кнопкой "Run workflow"
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+# Порт на хосте не секрет, поэтому обычная переменная
+env:
+  APP_PORT: "8081"
+
+jobs:
+  deploy-and-test:
+    # Критерий 1: job выполняется на нашем self-hosted runner
+    runs-on: self-hosted
+
+    # Критерий 3: конфиденциальные данные берём из GitHub Secrets
+    env:
+      DB_USER: ${{ secrets.DB_USER }}
+      DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
+      DB_NAME: ${{ secrets.DB_NAME }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Check that secrets are set
+        run: |
+          for v in DB_USER DB_PASSWORD DB_NAME; do
+            if [ -z "${!v}" ]; then
+              echo "::error::Secret $v is not set (Settings -> Secrets and variables -> Actions)"
+              exit 1
+            fi
+          done
+          echo "All secrets are set"
+
+      # Критерий 3: секреты подставляются в .env перед запуском
+      - name: Create .env from secrets
+        run: |
+          {
+            echo "DB_USER=$DB_USER"
+            echo "DB_PASSWORD=$DB_PASSWORD"
+            echo "DB_NAME=$DB_NAME"
+            echo "APP_PORT=$APP_PORT"
+          } > .env
+          mkdir -p reports logs
+          # Копия .env без значений — её сохраним как артефакт
+          sed 's/=.*/=***/' .env > reports/env-masked.txt
+          echo ".env created:"
+          cat reports/env-masked.txt
+
+      # Критерий 2: docker compose up -d
+      - name: Start stack with Docker Compose
+        run: |
+          docker compose up -d --build --wait --wait-timeout 120
+          docker compose ps
+
+      # Критерий 2: контейнеры действительно запущены
+      - name: Verify containers are running
+        run: |
+          running=$(docker compose ps --status running --services)
+          echo "Running services:"
+          echo "$running"
+          for s in app db; do
+            if ! echo "$running" | grep -qx "$s"; then
+              echo "::error::Service $s is not running"
+              docker compose logs "$s"
+              exit 1
+            fi
+          done
+          echo "All containers are running"
+
+      # Критерий 4: тесты приложения и БД
+      - name: Run application tests
+        run: |
+          BASE="http://localhost:$APP_PORT"
+          REPORT=reports/test-report.md
+          {
+            echo "# Test report"
+            echo "- date: $(date '+%Y-%m-%d %H:%M:%S')"
+            echo "- commit: $GITHUB_SHA"
+            echo "- run: $GITHUB_RUN_NUMBER"
+          } > "$REPORT"
+
+          echo "1. App and database connectivity"
+          ok=""
+          for _ in $(seq 1 20); do
+            if curl -fsS "$BASE/health"; then ok=1; break; fi
+            sleep 3
+          done
+          if [ -z "$ok" ]; then
+            echo "::error::/health failed: app is down or cannot reach the database"
+            exit 1
+          fi
+          curl -fsS "$BASE/" | grep -q "<html" || { echo "::error::Web page is not served"; exit 1; }
+          echo "- app + database: OK" >> "$REPORT"
+
+          echo "2. Data in database vs data shown in web interface"
+          DB_COUNT=$(docker compose exec -T db psql -U "$DB_USER" -d "$DB_NAME" -tAc "SELECT COUNT(*) FROM items;")
+          WEB_COUNT=$(curl -fsS "$BASE/api/items/count")
+          DB_NAMES=$(docker compose exec -T db psql -U "$DB_USER" -d "$DB_NAME" -tAc "SELECT name FROM items ORDER BY id;")
+          WEB_NAMES=$(curl -fsS "$BASE/api/items" | grep -o '"name":"[^"]*"' | cut -d'"' -f4)
+
+          echo "Database count: $DB_COUNT"
+          echo "Web API count:  $WEB_COUNT"
+          {
+            echo "- database records: $DB_COUNT"
+            echo "- web records: $WEB_COUNT"
+          } >> "$REPORT"
+
+          if [ "$DB_COUNT" != "$WEB_COUNT" ] || [ "$DB_NAMES" != "$WEB_NAMES" ]; then
+            echo "::error::Data mismatch between database and web interface"
+            echo "DB:";  echo "$DB_NAMES"
+            echo "WEB:"; echo "$WEB_NAMES"
+            echo "- data consistency: FAILED" >> "$REPORT"
+            exit 1
+          fi
+          echo "- data consistency: OK" >> "$REPORT"
+          echo "All tests passed"
+
+      # Логи и состояние Docker собираем всегда, даже если тесты упали
+      - name: Collect Docker logs
+        if: always()
+        run: |
+          mkdir -p logs
+          docker compose logs --no-color > logs/docker-compose-logs.txt 2>&1 || true
+          docker compose ps -a > logs/docker-compose-ps.txt 2>&1 || true
+          docker images > logs/docker-images.txt 2>&1 || true
+          docker ps -a > logs/docker-ps.txt 2>&1 || true
+
+      # Критерий 3: созданные файлы сохраняются как артефакты
+      - name: Upload report artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: deployment-report-${{ github.run_number }}
+          path: reports/
+          retention-days: 30
+
+      - name: Upload Docker logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-logs-${{ github.run_number }}
+          path: logs/
+          retention-days: 30
+
+      - name: Summary
+        if: always()
+        run: |
+          if [ -f reports/test-report.md ]; then
+            cat reports/test-report.md >> "$GITHUB_STEP_SUMMARY"
+          fi
+          echo "App: http://localhost:$APP_PORT" >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,9 @@
+# Не отправляем в контекст сборки лишнее и секреты
+.env
+.git
+.github
+init
+reports
+logs
+docker-compose.yml
+*.tar.gz

@@ -1,0 +1,54 @@
+# Стек: веб-приложение (Go: API + статика) и PostgreSQL.
+name: actions-practice
+
+services:
+  app:
+    build:
+      context: .                      # контекст — корень проекта (нужны и backend, и frontend)
+      dockerfile: backend/Dockerfile
+    # image не указываем: при наличии build он избыточен
+    container_name: app
+    ports:
+      - "${APP_PORT:-8080}:8080"      # наружу выставлено только веб-приложение; порт хоста из .env
+    environment:
+      HTTP_PORT: "8080"
+      STATIC_DIR: /app/static
+      DB_HOST: db                     # имя соседнего сервиса (DNS Docker)
+      DB_PORT: "5432"
+      DB_USER: ${DB_USER:?set DB_USER in .env}
+      DB_PASSWORD: ${DB_PASSWORD:?set DB_PASSWORD in .env}
+      DB_NAME: ${DB_NAME:?set DB_NAME in .env}
+    depends_on:
+      db:
+        condition: service_healthy    # ждём реальной готовности БД
+    restart: unless-stopped
+    networks:
+      - app_net
+
+  db:
+    image: postgres:16-alpine
+    container_name: app-db
+    environment:
+      POSTGRES_USER: ${DB_USER:?set DB_USER in .env}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?set DB_PASSWORD in .env}
+      POSTGRES_DB: ${DB_NAME:?set DB_NAME in .env}
+    # ports нет: БД недоступна снаружи, только из сети app_net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+    volumes:
+      - db_data:/var/lib/postgresql/data         # 1) именованный том: данные БД
+      - ./init:/docker-entrypoint-initdb.d:ro    # 2) bind mount с файловой системы хоста
+    restart: unless-stopped
+    networks:
+      - app_net
+
+volumes:
+  db_data:
+
+networks:
+  app_net:
+    driver: bridge
